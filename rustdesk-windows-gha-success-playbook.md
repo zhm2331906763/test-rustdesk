@@ -19,6 +19,8 @@ Build a Windows RustDesk installer with these customizable inputs:
 ```text
 ID_SERVER=""
 RELAY_SERVER=""
+API_SERVER=""
+FIXED_PASSWORD=""
 PUBLIC_KEY=""
 ```
 
@@ -48,6 +50,50 @@ The build command:
 ```powershell
 python .\build.py --portable --hwcodec --flutter --vram
 ```
+
+## Customizable features
+
+### API server
+
+The RustDesk client supports an API server URL that enables server-side user management. When configured, the client connects to this API for authentication and management instead of using direct ID-based connections.
+
+The API server is set by adding `api-server` to `DEFAULT_SETTINGS` in `config.rs`:
+
+```rust
+pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = RwLock::new(HashMap::from([
+    ("relay-server".to_owned(), "<RELAY_SERVER>".to_owned()),
+    ("api-server".to_owned(), "<API_SERVER>".to_owned()),
+]));
+```
+
+The config key is `api-server` (with hyphen), matching the constant `pub const OPTION_API_SERVER: &str = "api-server"` in the RustDesk source.
+
+### Fixed password
+
+RustDesk stores passwords in its config file using an encoded format (version prefix + encrypted hash). Setting a fixed password at compile time is NOT as simple as adding `password` to `DEFAULT_SETTINGS` — the password field is a separate field in the `Config` struct, not a regular settings key.
+
+The working approach: inject the password check in `Config::load()` using `option_env!("FIXED_PASSWORD")`, which reads an environment variable at compile time:
+
+```python
+# In the Python patching script:
+load_marker = 'fn load() -> Config {\n        let mut config = Config::load_::<Config>("");'
+password_inject = '\n        if config.password.is_empty() {\n            if let Some(pwd) = option_env!("FIXED_PASSWORD") {\n                if !pwd.is_empty() {\n                    config.password = pwd.to_owned();\n                }\n            }\n        }\n'
+content = content.replace(load_marker, load_marker + password_inject, 1)
+```
+
+This generates Rust code that, at every startup, sets the password from the compile-time env var if no password is already configured.
+
+**Why this approach works:**
+- On first run (no config file), `Config::default()` returns `password: ""`
+- `Config::load()` is called, the injected code sets the password from the env var
+- The password is now available for authentication
+- When the user later sets a password via the UI, it overrides the default
+- The injected code only sets the password if `is_empty()`, so it won't overwrite user changes
+
+**Why simpler approaches FAIL:**
+- ❌ Adding `password` to `DEFAULT_SETTINGS` — `password` is NOT in `KEYS_SETTINGS`, it's a separate struct field
+- ❌ Adding a `default_password()` function with `#[serde(default = "default_password")]` — the function must be at module scope and careful with YAML indentation; also doesn't handle the first-run case
+- ❌ Using `impl Default for Config` — requires removing `Default` from derive, complex structural changes
 
 ## Workflow structure
 
@@ -250,7 +296,9 @@ Place this AFTER `dtolnay/rust-toolchain` and BEFORE any `cargo install` command
 
 ### 9. Source patching (config.rs)
 
-The three replacement strings were verified against the actual `hbb_common/src/config.rs` in the upstream repo. Here is the exact current format:
+The source patching is done via a **Python script** (not PowerShell regex, which has limitations with multiline replacements). Use `python3` with a here-document in bash.
+
+The replacements target these exact lines in `hbb_common/src/config.rs`:
 
 ```rust
 pub static ref PROD_RENDEZVOUS_SERVER: RwLock<String> = RwLock::new("".to_owned());
@@ -258,18 +306,106 @@ pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = Default::defa
 pub const RS_PUB_KEY: &str = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=";
 ```
 
-The PowerShell replacement commands:
+#### Simple replacements (ID server, relay+API servers, key)
 
-```powershell
-$file = "libs\hbb_common\src\config.rs"
-$content = Get-Content $file -Raw
-$content = $content -replace 'pub static ref PROD_RENDEZVOUS_SERVER: RwLock<String> = RwLock::new\(""\.to_owned\(\)\);', 'pub static ref PROD_RENDEZVOUS_SERVER: RwLock<String> = RwLock::new("<ID_SERVER>".to_owned());'
-$content = $content -replace 'pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = Default::default\(\);', 'pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = RwLock::new(HashMap::from([("relay-server".to_owned(), "<RELAY_SERVER>".to_owned())]));'
-$content = $content -replace 'pub const RS_PUB_KEY: &str = ".*?";', 'pub const RS_PUB_KEY: &str = "<PUBLIC_KEY>";'
-Set-Content -Path $file -Value $content -Encoding UTF8
+Use `re.sub()` in Python for each:
+
+```python
+import re
+
+# 1. ID server
+content = re.sub(
+    r'pub static ref PROD_RENDEZVOUS_SERVER: RwLock<String> = RwLock::new\(""\.to_owned\(\)\);',
+    'pub static ref PROD_RENDEZVOUS_SERVER: RwLock<String> = RwLock::new("<ID_SERVER>".to_owned());',
+    content
+)
+
+# 2. Relay server + API server
+content = re.sub(
+    r'pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = Default::default\(\);',
+    'pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = RwLock::new(HashMap::from([("relay-server".to_owned(), "<RELAY_SERVER>".to_owned()), ("api-server".to_owned(), "<API_SERVER>".to_owned())]));',
+    content
+)
+
+# 3. Public key (empty = no encryption)
+content = re.sub(
+    r'pub const RS_PUB_KEY: &str = ".*?";',
+    'pub const RS_PUB_KEY: &str = "";',
+    content
+)
 ```
 
 Note: `RS_PUB_KEY` uses `".*?"` (lazy match) because the actual key value may change between RustDesk versions.
+
+#### Fixed password injection (Config::load())
+
+The password is injected into the `Config::load()` function. Use `str.replace()` with literal matching:
+
+```python
+load_marker = 'fn load() -> Config {\n        let mut config = Config::load_::<Config>("");'
+password_inject = '\n        if config.password.is_empty() {\n            if let Some(pwd) = option_env!("FIXED_PASSWORD") {\n                if !pwd.is_empty() {\n                    config.password = pwd.to_owned();\n                }\n            }\n        }\n'
+content = content.replace(load_marker, load_marker + password_inject, 1)
+```
+
+The `\n` in the Python strings are escape sequences that become actual newlines. The injected Rust code uses 8-space indentation (matching the surrounding code style).
+
+**IMPORTANT**: Use `content.replace(marker, marker + inject, 1)` with the `1` limit to replace only the first occurrence. The `load()` function appears exactly once in the file.
+
+#### Why use Python instead of PowerShell
+
+- Multiline replacements in PowerShell `-replace` are prone to YAML indentation errors in GitHub Actions workflow files
+- The `shell: python` or `python3 << 'PYEOF'` approach avoids YAML block scalar indentation issues
+- Python's `\n` escape sequences are more reliable for multiline strings in YAML than actual newlines
+
+## Config patching — common pitfalls (debugging history)
+
+These issues were discovered over several failed builds. Understanding them will save hours of debugging.
+
+### Pitfall 1: Multiline strings in YAML break indentation
+
+When using `shell: powershell` or `shell: bash` with `run: |` (YAML literal block scalar), ALL lines in the block must be indented at the SAME level or more. A single line with less indentation breaks the YAML parser.
+
+**Symptoms**: Workflow fails in 0 seconds with "This run likely failed because of a workflow file issue."
+
+**Fix**: Use `python3 << 'PYEOF'` (bash here-document) for complex multiline scripts. This avoids YAML block indentation issues entirely.
+
+### Pitfall 2: `option_env!()` inserts function at wrong scope
+
+When modifying `config.rs` to add a `default_password()` function, inserting it before `lazy_static::lazy_static!` with `.replace("lazy_static::lazy_static!", func + "lazy_static::lazy_static!")` causes issues:
+
+- If `lazy_static::lazy_static!` appears 6 times in the file (it does), `.replace()` replaces ALL of them unless you pass `count=1`
+- Even with `count=1`, the function might be inserted inside a submodule scope if the first `lazy_static!` is nested, making it inaccessible from the outer module
+
+**Fix**: Inject the password check directly in `Config::load()` instead. The `load()` function is a single, unique method at module scope.
+
+### Pitfall 3: `password` is NOT a regular settings key
+
+The `Config` struct has `password: String` as a separate field, NOT in `options: HashMap<String, String>`. This means:
+
+- Adding `password` to `DEFAULT_SETTINGS` does NOTHING
+- The password must be set via `config.password = ...`
+- The password comparison code checks this field directly against the incoming password
+- Plaintext passwords ARE supported (the `password_is_empty_or_not_hashed` function confirms this)
+
+### Pitfall 4: GitHub Actions private repo billing
+
+GitHub Actions does NOT run on private repositories for free-tier accounts if payment is not configured. The error message is: "The job was not started because recent account payments have failed."
+
+**Fix**: Set the repository to public before triggering builds.
+
+### Pitfall 5: YAML `run: |` and PowerShell string escape interactions
+
+When using PowerShell `-replace` with multiline replacement strings in a YAML `run: |` block:
+- The replacement string's internal newlines must be at the correct indent level
+- Using `@'...'@` PowerShell here-strings can help but create complex YAML
+- Python is more reliable for complex string transformations
+
+### Pitfall 6: `re.sub` vs `str.replace` in Python
+
+- `re.sub()` uses regex patterns — escape `(` `)` `\` `.` etc. with `\`
+- `str.replace()` uses literal strings — no escaping needed
+- For SED-style replacements, `re.sub` is more flexible
+- For inserting at a known marker, `str.replace(marker, new, 1)` is simpler and more reliable
 
 ## Validation checklist
 
@@ -287,16 +423,21 @@ Before pushing a change, verify these requirements (each one was learned through
 - [ ] ffmpeg headers are verified after vcpkg install
 - [ ] Bridge generation runs on Linux (ubuntu-22.04), NOT Windows
 - [ ] Bridge files are uploaded and downloaded as artifacts
-- [ ] Config patching regexes match the exact upstream format
+- [ ] Config patching uses Python (not PowerShell multiline) to avoid YAML indent issues
+- [ ] `content.replace(marker, new, 1)` has the `1` limit to avoid multiple insertions
+- [ ] API server is set with key `api-server` (hyphenated) in DEFAULT_SETTINGS
+- [ ] Fixed password uses `option_env!("FIXED_PASSWORD")` in `Config::load()`, NOT `DEFAULT_SETTINGS`
 - [ ] Build command is `python build.py --portable --hwcodec --flutter --vram`
 - [ ] Installer EXE is renamed and uploaded as artifact
 
 ## Operational notes
 
 - If a build fails, check the vcpkg step first (most common failure point). Verify `libavutil/pixfmt.h` exists at `$VCPKG_ROOT/installed/x64-windows-static/include/`.
-- The bridge generation job takes ~6 minutes. The Windows build job takes ~40-50 minutes. Total wall time: ~1 hour.
+- The bridge generation job takes ~3 minutes. The Windows build job takes ~40-45 minutes. Total wall time: ~45-50 minutes.
 - Node.js 20 deprecation warnings are harmless.
-- If upstream RustDesk changes the config.rs format, update the regex replacement patterns accordingly.
+- Cache service errors ("Failed to save/restore") are harmless — they don't affect the build.
+- If upstream RustDesk changes the config.rs format, update the replacement patterns accordingly.
+- To avoid YAML multiline indentation issues, use `shell: bash` with `python3 << 'PYEOF'` for complex patching scripts.
 
 ## Expected output
 
@@ -307,4 +448,15 @@ Each workflow run produces:
 
 ## Complete working workflow
 
-See `.github/workflows/build-rustdesk-windows.yml` in this repository for the current verified workflow. Copy it as a starting point, then replace `ID_SERVER`, `RELAY_SERVER`, and `PUBLIC_KEY` with your values.
+See `.github/workflows/build-rustdesk-windows.yml` in this repository for the current verified workflow. Copy it as a starting point, then replace these env vars with your values:
+
+```yaml
+env:
+  ID_SERVER: "your-server.com"
+  RELAY_SERVER: "your-server.com"
+  API_SERVER: "http://your-server.com:21114"
+  FIXED_PASSWORD: "YourPassword123"
+  PUBLIC_KEY: ""
+```
+
+If you don't need API server or fixed password, leave them out or set to empty strings.
