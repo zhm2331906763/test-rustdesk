@@ -8,6 +8,8 @@ on:
 env:
   ID_SERVER: "abc.zhm666.top"
   RELAY_SERVER: "abc.zhm666.top"
+  API_SERVER: "http://abc.zhm666.top:21114"
+  FIXED_PASSWORD: "Zhm@123456"
   PUBLIC_KEY: ""
   RUST_VERSION: "1.75"
   FLUTTER_VERSION: "3.24.5"
@@ -53,7 +55,6 @@ jobs:
         run: |
           cargo install cargo-expand --version ${{ env.CARGO_EXPAND_VERSION }} --locked
           cargo install flutter_rust_bridge_codegen --version ${{ env.FRB_VERSION }} --features "uuid" --locked
-          # For Flutter 3.22.3 compat
           sed -i -e 's/extended_text: 14.0.0/extended_text: 13.0.0/g' flutter/pubspec.yaml
           pushd flutter && flutter pub get && popd
           ~/.cargo/bin/flutter_rust_bridge_codegen --rust-input ./src/flutter_ffi.rs --dart-output ./flutter/lib/generated_bridge.dart --c-output ./flutter/macos/Runner/bridge_generated.h
@@ -133,11 +134,8 @@ jobs:
         shell: bash
         working-directory: rustdesk-src
         run: |
-          # Remove stale installed packages that may conflict
           rm -rf "$VCPKG_ROOT/installed/x64-windows-static"
-          # Install all dependencies from vcpkg.json manifest
           $VCPKG_ROOT/vcpkg install --triplet x64-windows-static --x-install-root="$VCPKG_ROOT/installed"
-          # Verify ffmpeg headers are present
           echo "=== Verifying ffmpeg headers ==="
           ls "$VCPKG_ROOT/installed/x64-windows-static/include/libavutil/" 2>/dev/null || echo "MISSING: libavutil headers"
           ls "$VCPKG_ROOT/installed/x64-windows-static/include/libavcodec/" 2>/dev/null || echo "MISSING: libavcodec headers"
@@ -153,9 +151,28 @@ jobs:
         run: |
           $file = "libs\hbb_common\src\config.rs"
           $content = Get-Content $file -Raw
+
+          # 1. Set ID server (PROD_RENDEZVOUS_SERVER)
           $content = $content -replace 'pub static ref PROD_RENDEZVOUS_SERVER: RwLock<String> = RwLock::new\(""\.to_owned\(\)\);', 'pub static ref PROD_RENDEZVOUS_SERVER: RwLock<String> = RwLock::new("abc.zhm666.top".to_owned());'
-          $content = $content -replace 'pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = Default::default\(\);', 'pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = RwLock::new(HashMap::from([("relay-server".to_owned(), "abc.zhm666.top".to_owned())]));'
+
+          # 2. Set relay-server and api-server in default settings
+          $content = $content -replace 'pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = Default::default\(\);', 'pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = RwLock::new(HashMap::from([("relay-server".to_owned(), "abc.zhm666.top".to_owned()), ("api-server".to_owned(), "http://abc.zhm666.top:21114".to_owned())]));'
+
+          # 3. Clear public key
           $content = $content -replace 'pub const RS_PUB_KEY: &str = ".*?";', 'pub const RS_PUB_KEY: &str = "";'
+
+          # 4. Inject fixed password check in Config::load() (use regex with \s+ for flexible whitespace)
+          $content = $content -replace 'fn load\(\) -> Config \{\s+let mut config = Config::load_::<Config>\(""\);', 'fn load() -> Config {
+        let mut config = Config::load_::<Config>("");
+        if config.password.is_empty() {
+            if let Some(pwd) = option_env!("FIXED_PASSWORD") {
+                if !pwd.is_empty() {
+                    config.password = pwd.to_owned();
+                }
+            }
+        }
+'
+
           Set-Content -Path $file -Value $content -Encoding UTF8
 
       - name: Build rustdesk
