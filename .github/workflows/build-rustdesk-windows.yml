@@ -15,10 +15,65 @@ env:
   CARGO_EXPAND_VERSION: "1.0.95"
   LLVM_VERSION: "15.0.6"
   VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  VCPKG_DEFAULT_HOST_TRIPLET: "x64-windows-static"
 
 jobs:
-  build:
+  generate-bridge:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout RustDesk source
+        run: git clone --recurse-submodules https://github.com/rustdesk/rustdesk.git rustdesk-src
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y clang cmake curl gcc git g++ libclang-dev libgtk-3-dev llvm-dev nasm ninja-build pkg-config wget
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-unknown-linux-gnu
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: bridge
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2.12.0
+        with:
+          channel: stable
+          flutter-version: "3.22.3"
+          cache: true
+
+      - name: Generate flutter-rust-bridge
+        working-directory: rustdesk-src
+        run: |
+          cargo install cargo-expand --version ${{ env.CARGO_EXPAND_VERSION }} --locked
+          cargo install flutter_rust_bridge_codegen --version ${{ env.FRB_VERSION }} --features "uuid" --locked
+          # For Flutter 3.22.3 compat
+          sed -i -e 's/extended_text: 14.0.0/extended_text: 13.0.0/g' flutter/pubspec.yaml
+          pushd flutter && flutter pub get && popd
+          ~/.cargo/bin/flutter_rust_bridge_codegen --rust-input ./src/flutter_ffi.rs --dart-output ./flutter/lib/generated_bridge.dart --c-output ./flutter/macos/Runner/bridge_generated.h
+          cp ./flutter/macos/Runner/bridge_generated.h ./flutter/ios/Runner/bridge_generated.h
+
+      - name: Upload bridge artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-artifact
+          path: |
+            rustdesk-src/src/bridge_generated.rs
+            rustdesk-src/src/bridge_generated.io.rs
+            rustdesk-src/flutter/lib/generated_bridge.dart
+            rustdesk-src/flutter/lib/generated_bridge.freezed.dart
+            rustdesk-src/flutter/macos/Runner/bridge_generated.h
+            rustdesk-src/flutter/ios/Runner/bridge_generated.h
+
+  build-windows:
     runs-on: windows-2022
+    needs: generate-bridge
     steps:
       - uses: actions/checkout@v4
 
@@ -74,20 +129,24 @@ jobs:
           vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
           doNotCache: false
 
-      - name: Install vcpkg dependencies
+      - name: Clean and install vcpkg dependencies
         shell: bash
         working-directory: rustdesk-src
         run: |
+          # Remove stale installed packages that may conflict
+          rm -rf "$VCPKG_ROOT/installed/x64-windows-static"
+          # Install all dependencies from vcpkg.json manifest
           $VCPKG_ROOT/vcpkg install --triplet x64-windows-static --x-install-root="$VCPKG_ROOT/installed"
+          # Verify ffmpeg headers are present
+          echo "=== Verifying ffmpeg headers ==="
+          ls "$VCPKG_ROOT/installed/x64-windows-static/include/libavutil/" 2>/dev/null || echo "MISSING: libavutil headers"
+          ls "$VCPKG_ROOT/installed/x64-windows-static/include/libavcodec/" 2>/dev/null || echo "MISSING: libavcodec headers"
 
-      - name: Generate flutter-rust-bridge
-        working-directory: rustdesk-src
-        shell: bash
-        run: |
-          cargo install cargo-expand --version $CARGO_EXPAND_VERSION --locked
-          cargo install flutter_rust_bridge_codegen --version $FRB_VERSION --features "uuid" --locked
-          pushd flutter && flutter pub get && popd
-          flutter_rust_bridge_codegen --rust-input ./src/flutter_ffi.rs --dart-output ./flutter/lib/generated_bridge.dart
+      - name: Restore bridge files
+        uses: actions/download-artifact@v4
+        with:
+          name: bridge-artifact
+          path: rustdesk-src
 
       - name: Patch RustDesk custom config
         working-directory: rustdesk-src
