@@ -6,11 +6,11 @@ on:
     branches: [main]
 
 env:
-  ID_SERVER: "abc.zhm666.top"
-  RELAY_SERVER: "abc.zhm666.top"
-  API_SERVER: "http://abc.zhm666.top:21114"
-  FIXED_PASSWORD: "Zhm@123456"
-  PUBLIC_KEY: ""
+  ID_SERVER: "hefei02.hefeiskb.top"
+  RELAY_SERVER: "hefei02.hefeiskb.top"
+  API_SERVER: "http://hefei02.hefeiskb.top:21114"
+  FIXED_PASSWORD: "Qianjyy520"
+  PUBLIC_KEY: "==Qfi0zZQtmWKdkQ6FTRRNDZkpGcwMDa1wmaT1GZ3Bldth0a0FTe5V2Txl1VpV0QiojI5V2aiwiIiojIpBXYiwiIw9GduI2azlWZmVGauIDMpVmZlhmI6ISehxWZyJCLiYTMxEjM6A3b05iYrNXalZWZo5iMwkWZmVGaiojI0N3boJye"
   RUST_VERSION: "1.75"
   FLUTTER_VERSION: "3.24.5"
   FRB_VERSION: "1.80.1"
@@ -151,33 +151,37 @@ jobs:
         working-directory: rustdesk-src
         run: |
           python3 << 'PYEOF'
-          import re
+          import re, os
+          id_server = os.environ.get("ID_SERVER", "")
+          relay_server = os.environ.get("RELAY_SERVER", "")
+          api_server = os.environ.get("API_SERVER", "")
+          public_key = os.environ.get("PUBLIC_KEY", "")
+
           with open("libs/hbb_common/src/config.rs", "r", encoding="utf-8") as f:
               content = f.read()
 
           # 1. Set ID server
           content = re.sub(
               r'pub static ref PROD_RENDEZVOUS_SERVER: RwLock<String> = RwLock::new\(""\.to_owned\(\)\);',
-              'pub static ref PROD_RENDEZVOUS_SERVER: RwLock<String> = RwLock::new("abc.zhm666.top".to_owned());',
+              f'pub static ref PROD_RENDEZVOUS_SERVER: RwLock<String> = RwLock::new("{id_server}".to_owned());',
               content
           )
 
           # 2. Set relay-server and api-server in default settings
           content = re.sub(
               r'pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = Default::default\(\);',
-              'pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = RwLock::new(HashMap::from([("relay-server".to_owned(), "abc.zhm666.top".to_owned()), ("api-server".to_owned(), "http://abc.zhm666.top:21114".to_owned())]));',
+              f'pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = RwLock::new(HashMap::from([("relay-server".to_owned(), "{relay_server}".to_owned()), ("api-server".to_owned(), "{api_server}".to_owned())]));',
               content
           )
 
-          # 3. Clear public key
+          # 3. Set public key
           content = re.sub(
               r'pub const RS_PUB_KEY: &str = ".*?";',
-              'pub const RS_PUB_KEY: &str = "";',
+              f'pub const RS_PUB_KEY: &str = "{public_key}";',
               content
           )
 
-          # 4. Inject fixed password in Config::load() using option_env! at compile time
-          # FIXED_PASSWORD env var is set in workflow and available to rustc via option_env!
+          # 4. Inject fixed password check into Config::load()
           load_marker = 'fn load() -> Config {\n        let mut config = Config::load_::<Config>("");'
           password_inject = '\n        if config.password.is_empty() {\n            if let Some(pwd) = option_env!("FIXED_PASSWORD") {\n                if !pwd.is_empty() {\n                    config.password = pwd.to_owned();\n                }\n            }\n        }\n'
           if load_marker in content:
@@ -192,10 +196,10 @@ jobs:
         working-directory: rustdesk-src
         run: |
           echo "=== Checking config.rs patches ==="
-          echo "ID server:"
-          grep -n "abc.zhm666.top" libs/hbb_common/src/config.rs | head -3
+          echo "ID/relay server:"
+          grep -n "hefei02.hefeiskb.top" libs/hbb_common/src/config.rs | head -3
           echo "API server:"
-          grep -n "api-server" libs/hbb_common/src/config.rs | head -3
+          grep -n "hefei02.hefeiskb.top:21114" libs/hbb_common/src/config.rs
           echo "Public key:"
           grep "RS_PUB_KEY" libs/hbb_common/src/config.rs
           echo "Password injection:"
