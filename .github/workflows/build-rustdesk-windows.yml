@@ -176,42 +176,12 @@ jobs:
               content
           )
 
-          # 4. Insert default_password() ONCE before the FIRST lazy_static block
-          password_func = '''
-          fn default_password() -> String {
-              match option_env!("FIXED_PASSWORD") {
-                  Some(pwd) if !pwd.is_empty() => pwd.to_string(),
-                  _ => String::new(),
-              }
-          }
-
-          '''
-          content = content.replace("lazy_static::lazy_static!", password_func + "lazy_static::lazy_static!", 1)
-
-          # 5. Change password serde attribute
-          content = content.replace(
-              '#[serde(default, deserialize_with = "deserialize_string")]\n    password: String,',
-              '#[serde(default = "default_password", deserialize_with = "deserialize_string")]\n    password: String,'
-          )
-
-          # 6. Inject fixed password check in Config::load() for first-run (no config file case)
-          # Find the load() function and insert after the first line
+          # 4. Inject fixed password in Config::load() using option_env! at compile time
+          # FIXED_PASSWORD env var is set in workflow and available to rustc via option_env!
           load_marker = 'fn load() -> Config {\n        let mut config = Config::load_::<Config>("");'
-          password_inject = '''
-          if config.password.is_empty() {
-              if let Some(pwd) = option_env!("FIXED_PASSWORD") {
-                  if !pwd.is_empty() {
-                      config.password = pwd.to_owned();
-                  }
-              }
-          }
-          '''
+          password_inject = '\n        if config.password.is_empty() {\n            if let Some(pwd) = option_env!("FIXED_PASSWORD") {\n                if !pwd.is_empty() {\n                    config.password = pwd.to_owned();\n                }\n            }\n        }\n'
           if load_marker in content:
-              content = content.replace(
-                  load_marker,
-                  load_marker + '\n' + password_inject,
-                  1
-              )
+              content = content.replace(load_marker, load_marker + password_inject, 1)
 
           with open("libs/hbb_common/src/config.rs", "w", encoding="utf-8") as f:
               f.write(content)
@@ -222,10 +192,14 @@ jobs:
         working-directory: rustdesk-src
         run: |
           echo "=== Checking config.rs patches ==="
-          echo "default_password count:"
-          grep -c "fn default_password" libs/hbb_common/src/config.rs
-          echo "---"
-          grep -n "default_password\|abc.zhm666.top\|api-server\|option_env.*FIXED" libs/hbb_common/src/config.rs
+          echo "ID server:"
+          grep -n "abc.zhm666.top" libs/hbb_common/src/config.rs | head -3
+          echo "API server:"
+          grep -n "api-server" libs/hbb_common/src/config.rs | head -3
+          echo "Public key:"
+          grep "RS_PUB_KEY" libs/hbb_common/src/config.rs
+          echo "Password injection:"
+          grep -n "FIXED_PASSWORD\|option_env" libs/hbb_common/src/config.rs
 
       - name: Build rustdesk
         working-directory: rustdesk-src
