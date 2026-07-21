@@ -176,7 +176,7 @@ jobs:
               content
           )
 
-          # 4. Insert default_password() function before lazy_static block
+          # 4. Insert default_password() ONCE before the FIRST lazy_static block
           password_func = '''
           fn default_password() -> String {
               match option_env!("FIXED_PASSWORD") {
@@ -186,40 +186,32 @@ jobs:
           }
 
           '''
-          content = content.replace("lazy_static::lazy_static!", password_func + "lazy_static::lazy_static!")
+          content = content.replace("lazy_static::lazy_static!", password_func + "lazy_static::lazy_static!", 1)
 
-          # 5. Change password serde attribute to use default_password()
+          # 5. Change password serde attribute
           content = content.replace(
               '#[serde(default, deserialize_with = "deserialize_string")]\n    password: String,',
               '#[serde(default = "default_password", deserialize_with = "deserialize_string")]\n    password: String,'
           )
 
-          # 6. Remove Default from Config derive (manual Default impl needed)
-          content = content.replace(
-              '#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]\npub struct Config {',
-              '#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]\npub struct Config {'
-          )
-
-          # 7. Add manual Default impl for Config after the struct closing brace
-          manual_default = '''
-
-          impl Default for Config {
-              fn default() -> Self {
-                  Self {
-                      password: default_password(),
-                      salt: String::new(),
-                      id: String::new(),
-                      enc_id: String::new(),
-                      key_pair: KeyPair::default(),
-                      key_confirmed: false,
-                      keys_confirmed: HashMap::new(),
+          # 6. Inject fixed password check in Config::load() for first-run (no config file case)
+          # Find the load() function and insert after the first line
+          load_marker = 'fn load() -> Config {\n        let mut config = Config::load_::<Config>("");'
+          password_inject = '''
+          if config.password.is_empty() {
+              if let Some(pwd) = option_env!("FIXED_PASSWORD") {
+                  if !pwd.is_empty() {
+                      config.password = pwd.to_owned();
                   }
               }
           }
           '''
-          struct_end = content.find("}\n\n#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]\npub struct Socks5Server")
-          if struct_end >= 0:
-              content = content[:struct_end+1] + manual_default + content[struct_end+1:]
+          if load_marker in content:
+              content = content.replace(
+                  load_marker,
+                  load_marker + '\n' + password_inject,
+                  1
+              )
 
           with open("libs/hbb_common/src/config.rs", "w", encoding="utf-8") as f:
               f.write(content)
@@ -230,7 +222,10 @@ jobs:
         working-directory: rustdesk-src
         run: |
           echo "=== Checking config.rs patches ==="
-          grep -n "default_password\|abc.zhm666.top\|api-server\|RS_PUB_KEY = \"\"" libs/hbb_common/src/config.rs || echo "Some patches may be missing!"
+          echo "default_password count:"
+          grep -c "fn default_password" libs/hbb_common/src/config.rs
+          echo "---"
+          grep -n "default_password\|abc.zhm666.top\|api-server\|option_env.*FIXED" libs/hbb_common/src/config.rs
 
       - name: Build rustdesk
         working-directory: rustdesk-src
