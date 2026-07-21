@@ -147,33 +147,90 @@ jobs:
           path: rustdesk-src
 
       - name: Patch RustDesk custom config
+        shell: bash
         working-directory: rustdesk-src
         run: |
-          $file = "libs\hbb_common\src\config.rs"
-          $content = Get-Content $file -Raw
+          python3 << 'PYEOF'
+          import re
+          with open("libs/hbb_common/src/config.rs", "r", encoding="utf-8") as f:
+              content = f.read()
 
-          # 1. Set ID server (PROD_RENDEZVOUS_SERVER)
-          $content = $content -replace 'pub static ref PROD_RENDEZVOUS_SERVER: RwLock<String> = RwLock::new\(""\.to_owned\(\)\);', 'pub static ref PROD_RENDEZVOUS_SERVER: RwLock<String> = RwLock::new("abc.zhm666.top".to_owned());'
+          # 1. Set ID server
+          content = re.sub(
+              r'pub static ref PROD_RENDEZVOUS_SERVER: RwLock<String> = RwLock::new\(""\.to_owned\(\)\);',
+              'pub static ref PROD_RENDEZVOUS_SERVER: RwLock<String> = RwLock::new("abc.zhm666.top".to_owned());',
+              content
+          )
 
           # 2. Set relay-server and api-server in default settings
-          $content = $content -replace 'pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = Default::default\(\);', 'pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = RwLock::new(HashMap::from([("relay-server".to_owned(), "abc.zhm666.top".to_owned()), ("api-server".to_owned(), "http://abc.zhm666.top:21114".to_owned())]));'
+          content = re.sub(
+              r'pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = Default::default\(\);',
+              'pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = RwLock::new(HashMap::from([("relay-server".to_owned(), "abc.zhm666.top".to_owned()), ("api-server".to_owned(), "http://abc.zhm666.top:21114".to_owned())]));',
+              content
+          )
 
           # 3. Clear public key
-          $content = $content -replace 'pub const RS_PUB_KEY: &str = ".*?";', 'pub const RS_PUB_KEY: &str = "";'
+          content = re.sub(
+              r'pub const RS_PUB_KEY: &str = ".*?";',
+              'pub const RS_PUB_KEY: &str = "";',
+              content
+          )
 
-          # 4. Inject fixed password check in Config::load() (use regex with \s+ for flexible whitespace)
-          $content = $content -replace 'fn load\(\) -> Config \{\s+let mut config = Config::load_::<Config>\(""\);', 'fn load() -> Config {
-        let mut config = Config::load_::<Config>("");
-        if config.password.is_empty() {
-            if let Some(pwd) = option_env!("FIXED_PASSWORD") {
-                if !pwd.is_empty() {
-                    config.password = pwd.to_owned();
-                }
-            }
-        }
-'
+          # 4. Insert default_password() function before lazy_static block
+          password_func = '''
+          fn default_password() -> String {
+              match option_env!("FIXED_PASSWORD") {
+                  Some(pwd) if !pwd.is_empty() => pwd.to_string(),
+                  _ => String::new(),
+              }
+          }
 
-          Set-Content -Path $file -Value $content -Encoding UTF8
+          '''
+          content = content.replace("lazy_static::lazy_static!", password_func + "lazy_static::lazy_static!")
+
+          # 5. Change password serde attribute to use default_password()
+          content = content.replace(
+              '#[serde(default, deserialize_with = "deserialize_string")]\n    password: String,',
+              '#[serde(default = "default_password", deserialize_with = "deserialize_string")]\n    password: String,'
+          )
+
+          # 6. Remove Default from Config derive (manual Default impl needed)
+          content = content.replace(
+              '#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]\npub struct Config {',
+              '#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]\npub struct Config {'
+          )
+
+          # 7. Add manual Default impl for Config after the struct closing brace
+          manual_default = '''
+
+          impl Default for Config {
+              fn default() -> Self {
+                  Self {
+                      password: default_password(),
+                      salt: String::new(),
+                      id: String::new(),
+                      enc_id: String::new(),
+                      key_pair: KeyPair::default(),
+                      key_confirmed: false,
+                      keys_confirmed: HashMap::new(),
+                  }
+              }
+          }
+          '''
+          struct_end = content.find("}\n\n#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]\npub struct Socks5Server")
+          if struct_end >= 0:
+              content = content[:struct_end+1] + manual_default + content[struct_end+1:]
+
+          with open("libs/hbb_common/src/config.rs", "w", encoding="utf-8") as f:
+              f.write(content)
+          PYEOF
+
+      - name: Verify config patches
+        shell: bash
+        working-directory: rustdesk-src
+        run: |
+          echo "=== Checking config.rs patches ==="
+          grep -n "default_password\|abc.zhm666.top\|api-server\|RS_PUB_KEY = \"\"" libs/hbb_common/src/config.rs || echo "Some patches may be missing!"
 
       - name: Build rustdesk
         working-directory: rustdesk-src
